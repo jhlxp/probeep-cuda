@@ -1,0 +1,24 @@
+# Python and native builds
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Local environments and machine-specific configuration
+.venv/
+venv/
+*.env
+!*.env.example
+
+# Profiling and benchmark artifacts
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.nsys-analysis
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store

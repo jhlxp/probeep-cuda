@@ -1,0 +1,29 @@
+diff --git a/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh b/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
+index bc585cc..ef29885 100644
+--- a/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
++++ b/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
+@@ -3736,7 +3736,7 @@ __device__ void combine_token_input_prepare_device_function(const int32_t* __rest
+                                         sizeof(float));
+                 // Track the completion of the LDGSTS instruction to the mbarrier.
+                 // We use the noinc version, so when BACKWARD_COMBINE is true, the mbarrier need to be init to 2 instead 1.
+-                cuda::ptx::cp_async_mbarrier_arrive_noinc(&smem_buffer_ptr->unpermute_mbarrier_G2S_buffer[token_stage][0]);
++                __pipeline_arrive_on(&smem_buffer_ptr->unpermute_mbarrier_G2S_buffer[token_stage][0]);
+               }
+
+               if(current_src_token_id == last_src_token_id){
+diff --git a/csrc/hybrid_ep/backend/ibvcore.h b/csrc/hybrid_ep/backend/ibvcore.h
+index e24dcd1..2c666bf 100644
+--- a/csrc/hybrid_ep/backend/ibvcore.h
++++ b/csrc/hybrid_ep/backend/ibvcore.h
+@@ -186,6 +186,11 @@ namespace hybrid_ep {
+
+  static ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex) {
+    int gidTblLen = portAttr->gid_tbl_len;
++   const char* gidIndexEnv = std::getenv("HYBRID_EP_IB_GID_INDEX");
++   if (gidIndexEnv != nullptr) {
++     *gidIndex = std::atoi(gidIndexEnv);
++     return ncclSuccess;
++   }
+    //for IB, choose GID Index that will have routable FLID if present
+    if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+      union ibv_gid gid;

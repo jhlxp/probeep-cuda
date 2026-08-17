@@ -1,0 +1,9 @@
+{
+  "schema": "probeep.source_lock.v1",
+  "ultraep_hybridep": {
+    "upstream_commit": "e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8",
+    "vendored_git_tree": "af3b7ef80fd3709d6f32df406e95eac38c5010a5",
+    "path": "src/ultraep/HybridEP"
+  },
+  "notes": "The vendored directory has no independent .git metadata. Validate its parent-repository Git tree, not git -C on the directory."
+}
