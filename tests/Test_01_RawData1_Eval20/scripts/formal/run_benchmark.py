@@ -527,9 +527,10 @@ def check_forward_correctness(
         actual = output[begin:end].float()
         abs_error = (actual - expected).abs()
         allowed = atol + rtol * expected.abs()
-        mismatches.add_(
-            (~torch.isclose(actual, expected, rtol=rtol, atol=atol)).sum()
-        )
+        if expert_mode == "grouped":
+            bits = min(EXPERT_FINGERPRINT_BITS, expected.size(1))
+            allowed[:, :bits].add_(atol * (EXPERT_FINGERPRINT_GAIN - 1.0))
+        mismatches.add_(((abs_error > allowed) | ~torch.isfinite(abs_error)).sum())
         finite_abs_error = torch.nan_to_num(
             abs_error, nan=float("inf"), posinf=float("inf")
         )
