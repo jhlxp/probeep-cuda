@@ -2634,6 +2634,7 @@ def update_manifest(
 def initialize_runtime(
     args: argparse.Namespace,
     *,
+    rank: int,
     num_experts: int,
     num_tokens: int,
     hidden: int,
@@ -3052,6 +3053,7 @@ def main(
         else:
             backend, grouped_weights = initialize_runtime(
                 args,
+                rank=rank,
                 num_experts=num_experts,
                 num_tokens=num_tokens,
                 hidden=hidden,
