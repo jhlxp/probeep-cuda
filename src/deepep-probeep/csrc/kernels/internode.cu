@@ -2421,7 +2421,7 @@ void balanced_combine(void* combined_x,
                                 kNumCombineForwarderWarps, \
                                 kNumTMABytesPerSenderWarp, \
                                 kNumTMABytesPerForwarderWarp, topk_rdma, \
-                                warps_per, forwarders, receivers, true, false>; \
+                                warps_per, forwarders, receivers, true, true>; \
     SET_SHARED_MEMORY_FOR_TMA(combine_func); \
     LAUNCH_KERNEL(&cfg, combine_func, \
                   reinterpret_cast<int4*>(combined_x), nullptr, \

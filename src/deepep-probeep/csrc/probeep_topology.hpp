@@ -22,10 +22,11 @@ inline constexpr int kMaxServers = 16;
 inline constexpr int kMaxWorldSize = kRanksPerServer * kMaxServers;
 inline constexpr int kMaxLocalExperts = 16;  // multi-server minimum is EP16
 
-// Thirty-two slots per rank provide 256 replica locations per server.  This
-// removes a server-wide artificial replica cap: any DSV3 expert set can be
-// placed on a server while the planner still prefers reuse and compactness.
-inline constexpr int kReplicaSlots = 32;
+// Match the ProbeEP reference/Test01 contract: one replica slot per local
+// expert.  The previous 32-slot over-allocation doubled the physical grouped
+// FFN and expert-pool footprint even though the corrected Eval20 plans use at
+// most nine remote experts on any rank.
+inline constexpr int kReplicaSlots = 16;
 inline constexpr int kMaxExecutionSlots =
         kMaxLocalExperts + kReplicaSlots;
 inline constexpr int kPlanRingSlots = 3;

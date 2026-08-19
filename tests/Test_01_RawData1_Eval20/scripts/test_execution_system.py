@@ -366,6 +366,10 @@ def test_cold_weight_version_is_unique_across_layers(monkeypatch) -> None:
         1, layer_id=1, phase="measured", iteration=3
     )
     assert first != second
+    same_layer_next_iteration = benchmark.set_probe_weight_version(
+        1, layer_id=1, phase="measured", iteration=4
+    )
+    assert same_layer_next_iteration == second
     assert os.environ["PROBEEP_WEIGHT_VERSION"] == str(second)
     # The active version is mutable; the case-level seed must not be polluted
     # by a previous layer in the persistent process.
@@ -377,7 +381,7 @@ def test_cold_weight_version_is_unique_across_layers(monkeypatch) -> None:
         iteration=3,
     )
     assert third < 2**63
-    assert third == 7_003_200_004
+    assert third == 7_003_200_001
 
 
 def test_eval20_formal_plan_passes_static_gate(tmp_path: Path) -> None:

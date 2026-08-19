@@ -30,7 +30,7 @@ class Buffer:
     num_sms: int = 20
     balanced_ranks_per_server: int = 8
     balanced_topk: int = 8
-    balanced_replica_slots: int = 32
+    balanced_replica_slots: int = 16
     balanced_token_padding: int = 8
     balanced_num_sms: int = 24
 

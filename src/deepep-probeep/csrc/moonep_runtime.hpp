@@ -215,6 +215,7 @@ public:
     int* symmetric_counts() const {
         return static_cast<int*>(symmetric_plan_base_);
     }
+    torch::Tensor& transport_y() { return transport_y_; }
     torch::Tensor probe_migration_budget(int compute_kind) const;
     torch::Tensor probe_controller_summary(int compute_kind) const;
     void reset_probe_controller(std::int64_t fallback_budget_bytes,
@@ -298,6 +299,9 @@ private:
     std::vector<torch::Tensor> home_grad_pointer_tables_;
     torch::Tensor weight_descriptors_;
     torch::Tensor grad_descriptors_;
+    // Combine launches are serialized on comm_stream, so all ring slots share
+    // one full-card precombine target.
+    torch::Tensor transport_y_;
     // Derived from the registered model shards; never inferred from a fixed
     // DSV3 example inside the planner or transport completion logic.
     std::int64_t expert_weight_bytes_ = 0;

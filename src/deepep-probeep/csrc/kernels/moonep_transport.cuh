@@ -17,6 +17,17 @@ void launch_bf16_route_weight_scale(void* exec_rows,
                                     int hidden,
                                     cudaStream_t stream);
 
+// Convert expert-grouped output into one contiguous row per received token.
+// A wide grid performs the local K-way reduction before the DeepEP sender so
+// the sender remains a pure TMA/network stage.
+void launch_precombine_bf16(void* transport_rows,
+                            const void* exec_rows,
+                            const float* exec_route_weight,
+                            const int* recv_route_rows,
+                            const int* recv_count,
+                            int hidden,
+                            cudaStream_t stream);
+
 // Exchange only rank counts, build the same four prefix objects consumed by
 // the normal DeepEP queue engine, and publish receive totals on the device.
 void balanced_notify_dispatch(const int* num_tokens_per_rank,

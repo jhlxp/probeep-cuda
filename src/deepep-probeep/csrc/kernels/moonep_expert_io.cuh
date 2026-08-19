@@ -25,6 +25,7 @@ struct WeightShardDescriptor {
     std::uint64_t home_slot_stride_bytes;
     std::uint64_t replica_buffer_offset_bytes;
     std::uint64_t replica_slot_stride_bytes;
+    std::uint64_t replica_plan_stride_bytes;
     std::uint64_t num_elements;
     std::uint32_t element_bytes;
 };

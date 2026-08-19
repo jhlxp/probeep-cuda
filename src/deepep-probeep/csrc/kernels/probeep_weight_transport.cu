@@ -92,9 +92,17 @@ __device__ __forceinline__ void copy_registered_weight_range(
             const auto slot_stride = from_home
                     ? shard.home_slot_stride_bytes
                     : shard.replica_slot_stride_bytes;
+            const auto plan_offset = from_home
+                    ? 0
+                    : static_cast<std::int64_t>(
+                              local_slot / kReplicaSlots) *
+                              shard.replica_plan_stride_bytes;
+            const auto slot_in_plan = from_home
+                    ? local_slot
+                    : local_slot % kReplicaSlots;
             auto* registered = static_cast<std::uint8_t*>(rank_base) +
-                    base_offset +
-                    static_cast<std::int64_t>(local_slot) * slot_stride +
+                    base_offset + plan_offset +
+                    static_cast<std::int64_t>(slot_in_plan) * slot_stride +
                     within_shard;
             auto* stage = staging + within_staging;
             const std::int64_t vector_bytes =

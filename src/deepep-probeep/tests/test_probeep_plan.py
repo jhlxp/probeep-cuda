@@ -57,6 +57,100 @@ def _count(plan, index: int) -> int:
     return int(plan["plan_counts"][index].item())
 
 
+def _moon_allocation(routes: torch.Tensor) -> torch.Tensor:
+    """Return MoonEP's deterministic server-local incumbent allocation."""
+
+    counts = torch.bincount(
+        routes.flatten().cpu(), minlength=EXPERTS
+    ).tolist()
+    world = routes.size(0)
+    local_experts = EXPERTS // world
+    alloc = [[0 for _ in range(world)] for _ in range(EXPERTS)]
+    home_load = [0 for _ in range(world)]
+    for expert, rows in enumerate(counts):
+        owner = expert // local_experts
+        alloc[expert][owner] = rows
+        home_load[owner] += rows
+
+    for rank_begin in range(0, world, 8):
+        server_total = sum(home_load[rank_begin : rank_begin + 8])
+        capacity, remainder = divmod(server_total, 8)
+        balance = [
+            home_load[rank_begin + local]
+            - capacity
+            - int(local < remainder)
+            for local in range(8)
+        ]
+        migration = [[0 for _ in range(8)] for _ in range(8)]
+        while max(balance) > 0:
+            donor = max(range(8), key=lambda local: (balance[local], -local))
+            receiver = min(
+                range(8), key=lambda local: (balance[local], local)
+            )
+            moved = -balance[receiver]
+            migration[donor][receiver] += moved
+            balance[donor] -= moved
+            balance[receiver] = 0
+
+        for owner_local in range(8):
+            owner = rank_begin + owner_local
+            remaining = counts[
+                owner * local_experts : (owner + 1) * local_experts
+            ].copy()
+            quotas = migration[owner_local].copy()
+            while max(quotas) > 0:
+                receiver_local = max(
+                    range(8), key=lambda local: (quotas[local], -local)
+                )
+                expert_local = max(
+                    range(local_experts),
+                    key=lambda local: (remaining[local], -local),
+                )
+                moved = min(quotas[receiver_local], remaining[expert_local])
+                expert = owner * local_experts + expert_local
+                receiver = rank_begin + receiver_local
+                alloc[expert][owner] -= moved
+                alloc[expert][receiver] += moved
+                remaining[expert_local] -= moved
+                quotas[receiver_local] -= moved
+    return torch.tensor(alloc, dtype=torch.int32)
+
+
+def test_closed_network_keeps_exact_moonep_incumbent() -> None:
+    _require_sm90()
+    routes = _server_imbalanced_routes(tokens=128)
+    plan = _plan(routes, 0)
+    torch.cuda.synchronize()
+
+    assert _count(plan, 0) == 0
+    torch.testing.assert_close(
+        plan["alloc"].cpu(), _moon_allocation(routes), rtol=0, atol=0
+    )
+
+
+def test_low_benefit_candidate_falls_back_to_moonep() -> None:
+    _require_sm90()
+    tokens = 64
+    token = torch.arange(
+        WORLD * tokens, dtype=torch.int64, device="cuda"
+    ).view(WORLD, tokens, 1)
+    lane = torch.arange(TOPK, dtype=torch.int64, device="cuda").view(
+        1, 1, TOPK
+    )
+    routes = ((token * TOPK + lane) % EXPERTS).contiguous()
+    rows = routes.view(-1, TOPK)
+    candidates = torch.nonzero(rows[:, 0] >= 128).flatten()[:64]
+    rows[candidates, 0] -= 128
+
+    plan = _plan(routes, 64 * 1024 * 1024)
+    torch.cuda.synchronize()
+    assert _count(plan, 3) > 0
+    assert _count(plan, 0) == 0
+    torch.testing.assert_close(
+        plan["alloc"].cpu(), _moon_allocation(routes), rtol=0, atol=0
+    )
+
+
 def test_compute_plan_is_network_independent_and_admission_is_atomic() -> None:
     _require_sm90()
     routes = _server_imbalanced_routes()
@@ -506,7 +600,7 @@ def test_second_stage_packing_and_route_lowering_are_exact() -> None:
     assert int(torch.unique(first["route_dst"]).numel()) == routes.numel()
 
     expected_layout = torch.zeros_like(first["is_token_in_rank"])
-    expected_layout.scatter_(2, exec_rank, True)
+    expected_layout.scatter_(2, exec_rank.to(torch.int64), True)
     torch.testing.assert_close(
         first["is_token_in_rank"], expected_layout, rtol=0, atol=0
     )

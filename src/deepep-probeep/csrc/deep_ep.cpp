@@ -301,6 +301,12 @@ Buffer::balanced_combine(const torch::Tensor& x,
                     (probeep::kTokenPadding - 1) * topology.execution_slots;
     const int hidden_int4 = static_cast<int>(
             probeep::kHidden * sizeof(nv_bfloat16) / sizeof(int4));
+    auto& transport_y = balanced_runtime->transport_y();
+    internode::launch_precombine_bf16(
+            transport_y.data_ptr(), x.data_ptr(),
+            slot.exec_weights.data_ptr<float>(),
+            slot.recv_route_rows.data_ptr<int>(),
+            slot.recv_count.data_ptr<int>(), probeep::kHidden, comm_stream);
     internode::cached_notify(
             hidden_int4, 0, 0, probeep::kTopK, num_ranks,
             probeep::kNumChannels, num_tokens,
@@ -316,8 +322,8 @@ Buffer::balanced_combine(const torch::Tensor& x,
             num_nvl_bytes, false, false);
     internode::balanced_combine(
             slot.combined_x.data_ptr(),
-            slot.is_token_in_rank.data_ptr<bool>(), x.data_ptr(),
-            slot.exec_weights.data_ptr<float>(),
+            slot.is_token_in_rank.data_ptr<bool>(), transport_y.data_ptr(),
+            nullptr,
             slot.recv_route_rows.data_ptr<int>(),
             slot.recv_count.data_ptr<int>(),
             slot.send_rdma_head.data_ptr<int>(),
@@ -443,6 +449,11 @@ Buffer::balanced_combine_backward(
     EP_HOST_ASSERT(exec_grad_x.size(0) >= nvs);
     const int hidden_int4 = static_cast<int>(
             probeep::kHidden * sizeof(nv_bfloat16) / sizeof(int4));
+    auto& transport_y = balanced_runtime->transport_y();
+    internode::launch_precombine_bf16(
+            transport_y.data_ptr(), exec_grad_x.data_ptr(), nullptr,
+            slot.recv_route_rows.data_ptr<int>(),
+            slot.recv_count.data_ptr<int>(), probeep::kHidden, comm_stream);
     internode::cached_notify(
             hidden_int4, 0, 0, probeep::kTopK, num_ranks,
             probeep::kNumChannels, num_tokens,
@@ -458,7 +469,7 @@ Buffer::balanced_combine_backward(
             num_nvl_bytes, false, false);
     internode::balanced_combine(
             slot.combined_x.data_ptr(),
-            slot.is_token_in_rank.data_ptr<bool>(), exec_grad_x.data_ptr(),
+            slot.is_token_in_rank.data_ptr<bool>(), transport_y.data_ptr(),
             nullptr, slot.recv_route_rows.data_ptr<int>(),
             slot.recv_count.data_ptr<int>(),
             slot.send_rdma_head.data_ptr<int>(),

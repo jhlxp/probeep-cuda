@@ -56,9 +56,14 @@ __global__ __launch_bounds__(kThreadsPerBlock) void direct_replica_weight_copy_k
             for (int replica_slot = 0; replica_slot < num_replica_slots; ++replica_slot) {
                 const int map_offset = peer_rank * num_replica_slots + replica_slot;
                 if (domain_replica_expert[map_offset] == global_expert) {
+                    const int physical_slot = replica_slot_base + replica_slot;
+                    const int plan_slot = physical_slot / num_replica_slots;
+                    const int replica_in_plan = physical_slot % num_replica_slots;
                     replica_shard_addresses[replica_count++] = reinterpret_cast<std::uint64_t>(
                         peer_base + shard.replica_buffer_offset_bytes +
-                        static_cast<std::uint64_t>(replica_slot_base + replica_slot) *
+                        static_cast<std::uint64_t>(plan_slot) *
+                            shard.replica_plan_stride_bytes +
+                        static_cast<std::uint64_t>(replica_in_plan) *
                             shard.replica_slot_stride_bytes);
                 }
             }

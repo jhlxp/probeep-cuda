@@ -21,6 +21,10 @@ constexpr int kHistogramSegmentRoutes = 256;
 constexpr int kPackedOrdinalBits = 16;
 constexpr int kPackedOrdinalMask = (1 << kPackedOrdinalBits) - 1;
 constexpr int kIntentFields = 6;
+// A server-first candidate must remove enough padded work to cover planner,
+// replica and launch overhead.  Smaller improvements keep the exact MoonEP
+// server-local incumbent instead of perturbing a working layout.
+constexpr int kMinimumServerPaddedGainPermille = 30;
 
 struct PlanConfig {
     int world_size;
@@ -1036,6 +1040,165 @@ __global__ void build_probeep_plan(
     }
 }
 
+// Materialize the same raw-row-balanced server-local incumbent used by
+// MoonEP.  ProbeEP admission starts from this allocation and therefore only
+// changes assignments that are required by an accepted cross-server move.
+// ``baseline_alloc`` preserves the incumbent for the post-admission benefit
+// decision; finalize_probeep_plan reuses that buffer later for prefixes.
+__global__ void build_moonep_baseline(
+        const int* count_prefix,
+        int* alloc,
+        int* baseline_alloc,
+        int* plan_counts,
+        PlanConfig cfg) {
+    const auto phase_start = clock64();
+    const int server = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (server >= cfg.num_servers)
+        return;
+
+    __shared__ int group_tokens[kRanksPerServer];
+    __shared__ int balance[kRanksPerServer];
+    __shared__ int migration[kRanksPerServer][kRanksPerServer];
+    __shared__ int quotas[kRanksPerServer];
+    __shared__ int remaining[kMaxLocalExperts];
+
+    const int rank_begin = server * kRanksPerServer;
+    for (int index = tid; index < kNumExperts * kRanksPerServer;
+         index += blockDim.x) {
+        const int expert = index / kRanksPerServer;
+        const int local = index % kRanksPerServer;
+        alloc[expert * cfg.world_size + rank_begin + local] = 0;
+    }
+    for (int index = tid; index < kRanksPerServer * kRanksPerServer;
+         index += blockDim.x)
+        reinterpret_cast<int*>(migration)[index] = 0;
+    __syncthreads();
+
+    if (tid < kRanksPerServer) {
+        const int rank = rank_begin + tid;
+        int load = 0;
+        for (int local_expert = 0;
+             local_expert < cfg.local_experts; ++local_expert) {
+            const int expert = rank * cfg.local_experts + local_expert;
+            const int total = count_prefix[
+                    (cfg.world_size - 1) * kNumExperts + expert];
+            alloc[expert * cfg.world_size + rank] = total;
+            load += total;
+        }
+        group_tokens[tid] = load;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int server_tokens = 0;
+        for (int local = 0; local < kRanksPerServer; ++local)
+            server_tokens += group_tokens[local];
+        const int capacity = server_tokens / kRanksPerServer;
+        const int remainder = server_tokens - capacity * kRanksPerServer;
+        for (int local = 0; local < kRanksPerServer; ++local)
+            balance[local] = group_tokens[local] - capacity -
+                    (local < remainder ? 1 : 0);
+
+        while (true) {
+            int surplus_local = -1;
+            int surplus = 0;
+            int deficit_local = -1;
+            int deficit = 0;
+            for (int local = 0; local < kRanksPerServer; ++local) {
+                if (balance[local] > surplus ||
+                    (balance[local] == surplus && balance[local] > 0 &&
+                     (surplus_local < 0 || local < surplus_local))) {
+                    surplus = balance[local];
+                    surplus_local = local;
+                }
+                if (balance[local] < deficit ||
+                    (balance[local] == deficit && balance[local] < 0 &&
+                     (deficit_local < 0 || local < deficit_local))) {
+                    deficit = balance[local];
+                    deficit_local = local;
+                }
+            }
+            if (surplus <= 0)
+                break;
+            const int move = -deficit;
+            migration[surplus_local][deficit_local] += move;
+            balance[surplus_local] -= move;
+            balance[deficit_local] = 0;
+        }
+
+        for (int owner_local = 0; owner_local < kRanksPerServer;
+             ++owner_local) {
+            const int owner = rank_begin + owner_local;
+            for (int destination_local = 0;
+                 destination_local < kRanksPerServer; ++destination_local)
+                quotas[destination_local] =
+                        migration[owner_local][destination_local];
+            for (int local_expert = 0;
+                 local_expert < cfg.local_experts; ++local_expert) {
+                const int expert = owner * cfg.local_experts + local_expert;
+                remaining[local_expert] = count_prefix[
+                        (cfg.world_size - 1) * kNumExperts + expert];
+            }
+
+            while (true) {
+                int target_local = -1;
+                int max_quota = 0;
+                for (int destination_local = 0;
+                     destination_local < kRanksPerServer;
+                     ++destination_local) {
+                    const int quota = quotas[destination_local];
+                    if (quota > max_quota ||
+                        (quota == max_quota && quota > 0 &&
+                         (target_local < 0 ||
+                          destination_local < target_local))) {
+                        max_quota = quota;
+                        target_local = destination_local;
+                    }
+                }
+                if (max_quota <= 0)
+                    break;
+
+                int selected_local_expert = -1;
+                int max_remaining = 0;
+                for (int local_expert = 0;
+                     local_expert < cfg.local_experts; ++local_expert) {
+                    const int rows = remaining[local_expert];
+                    if (rows > max_remaining ||
+                        (rows == max_remaining && rows > 0 &&
+                         (selected_local_expert < 0 ||
+                          local_expert < selected_local_expert))) {
+                        max_remaining = rows;
+                        selected_local_expert = local_expert;
+                    }
+                }
+                const int take = min(max_remaining, max_quota);
+                const int expert = owner * cfg.local_experts +
+                        selected_local_expert;
+                const int target = rank_begin + target_local;
+                alloc[expert * cfg.world_size + target] += take;
+                alloc[expert * cfg.world_size + owner] -= take;
+                remaining[selected_local_expert] -= take;
+                quotas[target_local] -= take;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int index = tid; index < kNumExperts * kRanksPerServer;
+         index += blockDim.x) {
+        const int expert = index / kRanksPerServer;
+        const int local = index % kRanksPerServer;
+        const int rank = rank_begin + local;
+        baseline_alloc[expert * cfg.world_size + rank] =
+                alloc[expert * cfg.world_size + rank];
+    }
+    if (tid == 0)
+        atomicMax(plan_counts + 11, static_cast<int>(min(
+                clock64() - phase_start,
+                static_cast<unsigned long long>(INT_MAX))));
+}
+
 // Replay the immutable compute-only intent sequence through the network
 // controller in its own kernel.  Separating this serial dependency chain from
 // candidate generation drops the candidate kernel's register/shared-memory
@@ -1103,6 +1266,21 @@ __global__ void admit_probeep_intents(
         server_expert_rows[index] = 0;
     __syncthreads();
 
+    // The incumbent is already MoonEP-balanced inside every server.  Recover
+    // its rank loads and occupied replica slots instead of silently replacing
+    // it with the original home-rank allocation.
+    for (int index = threadIdx.x;
+         index < kNumExperts * cfg.world_size;
+         index += blockDim.x) {
+        const int expert = index / cfg.world_size;
+        const int rank = index % cfg.world_size;
+        const int rows = alloc[index];
+        if (rows <= 0)
+            continue;
+        atomicAdd(actual_rank_load + rank, rows);
+        if (rank != owner_rank(expert, cfg))
+            atomicAdd(remote_expert_count + rank, 1);
+    }
     for (int expert = threadIdx.x; expert < kNumExperts;
          expert += blockDim.x) {
         const int total = count_prefix[
@@ -1110,7 +1288,6 @@ __global__ void admit_probeep_intents(
         const int owner = owner_rank(expert, cfg);
         const int server = owner / kRanksPerServer;
         server_expert_rows[expert * cfg.num_servers + server] = total;
-        atomicAdd(actual_rank_load + owner, total);
         atomicAdd(actual_server_load + server, total);
         atomicAdd(actual_server_padded + server,
                   padded_rows(total, cfg.token_padding));
@@ -1347,6 +1524,222 @@ __global__ void admit_probeep_intents(
         dispatch_tx[rank] = bounded_dispatch_bytes(dispatch_tx[rank], cfg);
         dispatch_rx[rank] = bounded_dispatch_bytes(dispatch_rx[rank], cfg);
     }
+}
+
+// Restore the MoonEP incumbent when network admission only realizes a
+// marginal compute improvement.  The controller budget answers "can this
+// migration fit"; this decision answers the separate "is it worth changing
+// the layout" question.
+__global__ void enforce_probeep_benefit(
+        const int* counts,
+        const int* count_prefix,
+        const int* baseline_alloc,
+        const int* compute_intents,
+        const int* server_padded_load_before,
+        int* alloc,
+        int* server_expert_rows,
+        std::int64_t* assigned_tx,
+        std::int64_t* assigned_rx,
+        std::int64_t* dispatch_tx,
+        std::int64_t* dispatch_rx,
+        std::int64_t* pair_load,
+        int* admitted_experts,
+        bool* deferred_experts,
+        int* plan_counts,
+        PlanConfig cfg) {
+    __shared__ bool use_moonep;
+    if (threadIdx.x == 0) {
+        int before_max = 0;
+        int after_max = 0;
+        for (int server = 0; server < cfg.num_servers; ++server) {
+            before_max = max(before_max, server_padded_load_before[server]);
+            int padded = 0;
+            for (int expert = 0; expert < kNumExperts; ++expert)
+                padded += padded_rows(server_expert_rows[
+                        expert * cfg.num_servers + server],
+                        cfg.token_padding);
+            after_max = max(after_max, padded);
+        }
+        const int gain = before_max - after_max;
+        use_moonep = plan_counts[0] > 0 &&
+                (gain <= 0 ||
+                 static_cast<std::int64_t>(gain) * 1000 <
+                         static_cast<std::int64_t>(before_max) *
+                                 kMinimumServerPaddedGainPermille);
+    }
+    __syncthreads();
+    if (!use_moonep)
+        return;
+
+    for (int index = threadIdx.x;
+         index < kNumExperts * cfg.world_size;
+         index += blockDim.x)
+        alloc[index] = baseline_alloc[index];
+    for (int index = threadIdx.x;
+         index < kNumExperts * cfg.num_servers;
+         index += blockDim.x) {
+        const int expert = index / cfg.num_servers;
+        const int server = index % cfg.num_servers;
+        const int total = count_prefix[
+                (cfg.world_size - 1) * kNumExperts + expert];
+        server_expert_rows[index] =
+                server == owner_server(expert, cfg) ? total : 0;
+    }
+    for (int rank = threadIdx.x; rank < cfg.world_size;
+         rank += blockDim.x) {
+        assigned_tx[rank] = 0;
+        assigned_rx[rank] = 0;
+        dispatch_tx[rank] = 0;
+        dispatch_rx[rank] = 0;
+    }
+    for (int index = threadIdx.x;
+         index < cfg.num_servers * cfg.num_servers * kRanksPerServer;
+         index += blockDim.x)
+        pair_load[index] = 0;
+    for (int expert = threadIdx.x; expert < kNumExperts;
+         expert += blockDim.x)
+        deferred_experts[expert] = false;
+    __syncthreads();
+
+    accumulate_expert_dispatch<true>(
+            counts, alloc, static_cast<int>(threadIdx.x), 1, cfg,
+            dispatch_tx, dispatch_rx);
+    __syncthreads();
+    for (int rank = threadIdx.x; rank < cfg.world_size;
+         rank += blockDim.x) {
+        dispatch_tx[rank] = bounded_dispatch_bytes(dispatch_tx[rank], cfg);
+        dispatch_rx[rank] = bounded_dispatch_bytes(dispatch_rx[rank], cfg);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int deferred_count = 0;
+        for (int intent = 0; intent < plan_counts[3]; ++intent) {
+            const int expert = compute_intents[intent * kIntentFields];
+            if (!deferred_experts[expert]) {
+                deferred_experts[expert] = true;
+                ++deferred_count;
+            }
+        }
+        plan_counts[0] = 0;
+        plan_counts[1] = 0;
+        plan_counts[4] = deferred_count;
+        admitted_experts[0] = -1;
+    }
+}
+
+// Repair only rank imbalance introduced by accepted cross-server moves.  The
+// MoonEP incumbent is already balanced, so this local flow changes the minimum
+// rows needed to recover exact per-server rank capacities and strongly prefers
+// already-resident experts to avoid replica/GEMM fragmentation.
+__global__ void repair_server_local_minimal(
+        int* alloc,
+        int* plan_counts,
+        PlanConfig cfg) {
+    const auto phase_start = clock64();
+    const int server = static_cast<int>(blockIdx.x);
+    if (server >= cfg.num_servers || threadIdx.x != 0)
+        return;
+
+    int load[kRanksPerServer] = {0};
+    int balance[kRanksPerServer] = {0};
+    int remote_experts[kRanksPerServer] = {0};
+    const int rank_begin = server * kRanksPerServer;
+    int server_rows = 0;
+    for (int expert = 0; expert < kNumExperts; ++expert) {
+        const int home = owner_rank(expert, cfg);
+        for (int local = 0; local < kRanksPerServer; ++local) {
+            const int rank = rank_begin + local;
+            const int rows = alloc[expert * cfg.world_size + rank];
+            load[local] += rows;
+            server_rows += rows;
+            if (rows > 0 && rank != home)
+                ++remote_experts[local];
+        }
+    }
+    const int capacity = server_rows / kRanksPerServer;
+    const int remainder = server_rows - capacity * kRanksPerServer;
+    for (int local = 0; local < kRanksPerServer; ++local)
+        balance[local] = load[local] - capacity -
+                (local < remainder ? 1 : 0);
+
+    for (int step = 0;
+         step < kNumExperts * kRanksPerServer; ++step) {
+        int donor_local = -1;
+        int surplus = 0;
+        int receiver_local = -1;
+        int deficit = 0;
+        for (int local = 0; local < kRanksPerServer; ++local) {
+            if (balance[local] > surplus ||
+                (balance[local] == surplus && balance[local] > 0 &&
+                 (donor_local < 0 || local < donor_local))) {
+                donor_local = local;
+                surplus = balance[local];
+            }
+            if (balance[local] < deficit ||
+                (balance[local] == deficit && balance[local] < 0 &&
+                 (receiver_local < 0 || local < receiver_local))) {
+                receiver_local = local;
+                deficit = balance[local];
+            }
+        }
+        if (surplus <= 0)
+            break;
+
+        const int donor = rank_begin + donor_local;
+        const int receiver = rank_begin + receiver_local;
+        int best_expert = -1;
+        int best_reuse = -1;
+        int best_take = -1;
+        int best_rows = -1;
+        for (int expert = 0; expert < kNumExperts; ++expert) {
+            const int donor_rows = alloc[
+                    expert * cfg.world_size + donor];
+            if (donor_rows <= 0)
+                continue;
+            const int receiver_rows = alloc[
+                    expert * cfg.world_size + receiver];
+            const int home = owner_rank(expert, cfg);
+            const bool reuse = receiver_rows > 0 || receiver == home;
+            if (!reuse && remote_experts[receiver_local] >= kReplicaSlots)
+                continue;
+            const int take = min(donor_rows, min(surplus, -deficit));
+            if (static_cast<int>(reuse) > best_reuse ||
+                (static_cast<int>(reuse) == best_reuse &&
+                 (take > best_take ||
+                  (take == best_take &&
+                   (donor_rows > best_rows ||
+                    (donor_rows == best_rows &&
+                     (best_expert < 0 || expert < best_expert))))))) {
+                best_expert = expert;
+                best_reuse = static_cast<int>(reuse);
+                best_take = take;
+                best_rows = donor_rows;
+            }
+        }
+        if (best_expert < 0 || best_take <= 0) {
+            atomicExch(plan_counts + 2, 1);
+            break;
+        }
+
+        const int home = owner_rank(best_expert, cfg);
+        const int donor_before = alloc[
+                best_expert * cfg.world_size + donor];
+        const int receiver_before = alloc[
+                best_expert * cfg.world_size + receiver];
+        alloc[best_expert * cfg.world_size + donor] -= best_take;
+        alloc[best_expert * cfg.world_size + receiver] += best_take;
+        if (receiver_before == 0 && receiver != home)
+            ++remote_experts[receiver_local];
+        if (donor_before == best_take && donor != home)
+            --remote_experts[donor_local];
+        balance[donor_local] -= best_take;
+        balance[receiver_local] += best_take;
+    }
+
+    atomicMax(plan_counts + 11, static_cast<int>(min(
+            clock64() - phase_start,
+            static_cast<unsigned long long>(INT_MAX))));
 }
 
 // The old fused block selected every server's hot experts with P independent
@@ -1781,6 +2174,9 @@ void launch_probeep_plan_from_ipc_counts(
             workspace.endpoint_total_cap_bytes,
             workspace.admitted_experts, workspace.deferred_experts,
             workspace.chunk_table, workspace.plan_counts);
+    build_moonep_baseline<<<cfg.num_servers, kThreads, 0, stream>>>(
+            workspace.count_prefix, workspace.alloc,
+            workspace.alloc_prefix, workspace.plan_counts, cfg);
     admit_probeep_intents<<<1, kAdmissionThreads, 0, stream>>>(
             workspace.global_counts, workspace.count_prefix,
             workspace.endpoint_total_cap_bytes,
@@ -1790,9 +2186,17 @@ void launch_probeep_plan_from_ipc_counts(
             workspace.pair_load_bytes, workspace.server_expert_rows,
             workspace.admitted_experts, workspace.deferred_experts,
             workspace.chunk_table, workspace.plan_counts, cfg);
-    pack_server_local<<<cfg.num_servers, kThreads, 0, stream>>>(
-            workspace.server_expert_rows, workspace.alloc,
+    enforce_probeep_benefit<<<1, kThreads, 0, stream>>>(
+            workspace.global_counts, workspace.count_prefix,
+            workspace.alloc_prefix, workspace.compute_intents,
+            workspace.server_padded_load_before, workspace.alloc,
+            workspace.server_expert_rows, workspace.assigned_tx_bytes,
+            workspace.assigned_rx_bytes, workspace.dispatch_tx_bytes,
+            workspace.dispatch_rx_bytes, workspace.pair_load_bytes,
+            workspace.admitted_experts, workspace.deferred_experts,
             workspace.plan_counts, cfg);
+    repair_server_local_minimal<<<cfg.num_servers, 1, 0, stream>>>(
+            workspace.alloc, workspace.plan_counts, cfg);
     finalize_probeep_plan<<<1, kThreads, 0, stream>>>(
             workspace.count_prefix, workspace.server_expert_rows,
             workspace.alloc, workspace.alloc_prefix,
@@ -1949,6 +2353,9 @@ ProbePlanCuda plan_probeep_cuda(
             endpoint_total_cap.data_ptr<std::int64_t>(),
             admitted.data_ptr<int>(), deferred.data_ptr<bool>(),
             chunks.data_ptr<std::int64_t>(), plan_counts.data_ptr<int>());
+    build_moonep_baseline<<<cfg.num_servers, kThreads, 0, stream>>>(
+            count_prefix.data_ptr<int>(), alloc.data_ptr<int>(),
+            alloc_prefix.data_ptr<int>(), plan_counts.data_ptr<int>(), cfg);
     admit_probeep_intents<<<1, kAdmissionThreads, 0, stream>>>(
             counts.data_ptr<int>(), count_prefix.data_ptr<int>(),
             endpoint_total_cap.data_ptr<std::int64_t>(),
@@ -1961,9 +2368,19 @@ ProbePlanCuda plan_probeep_cuda(
             server_expert_rows.data_ptr<int>(), admitted.data_ptr<int>(),
             deferred.data_ptr<bool>(), chunks.data_ptr<std::int64_t>(),
             plan_counts.data_ptr<int>(), cfg);
-    pack_server_local<<<cfg.num_servers, kThreads, 0, stream>>>(
-            server_expert_rows.data_ptr<int>(), alloc.data_ptr<int>(),
-            plan_counts.data_ptr<int>(), cfg);
+    enforce_probeep_benefit<<<1, kThreads, 0, stream>>>(
+            counts.data_ptr<int>(), count_prefix.data_ptr<int>(),
+            alloc_prefix.data_ptr<int>(), compute_intents.data_ptr<int>(),
+            padded_before.data_ptr<int>(), alloc.data_ptr<int>(),
+            server_expert_rows.data_ptr<int>(),
+            assigned_tx.data_ptr<std::int64_t>(),
+            assigned_rx.data_ptr<std::int64_t>(),
+            dispatch_tx.data_ptr<std::int64_t>(),
+            dispatch_rx.data_ptr<std::int64_t>(),
+            pair_load.data_ptr<std::int64_t>(), admitted.data_ptr<int>(),
+            deferred.data_ptr<bool>(), plan_counts.data_ptr<int>(), cfg);
+    repair_server_local_minimal<<<cfg.num_servers, 1, 0, stream>>>(
+            alloc.data_ptr<int>(), plan_counts.data_ptr<int>(), cfg);
     finalize_probeep_plan<<<1, kThreads, 0, stream>>>(
             count_prefix.data_ptr<int>(), server_expert_rows.data_ptr<int>(),
             alloc.data_ptr<int>(), alloc_prefix.data_ptr<int>(),

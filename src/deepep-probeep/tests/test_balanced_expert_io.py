@@ -26,17 +26,19 @@ RANKS_PER_SERVER = 8
 NUM_SERVERS = 2
 NUM_EXPERTS = 256
 LOCAL_EXPERTS = 16
-REPLICA_SLOTS = 32
+REPLICA_SLOTS = 16
 PLAN_SLOTS = 3
 EXECUTION_SLOTS = LOCAL_EXPERTS + REPLICA_SLOTS
-POOL_SLOTS = LOCAL_EXPERTS + PLAN_SLOTS * REPLICA_SLOTS
+WEIGHT_SLOTS_PER_PLAN = LOCAL_EXPERTS + REPLICA_SLOTS
+WEIGHT_POOL_SLOTS = PLAN_SLOTS * WEIGHT_SLOTS_PER_PLAN
+GRAD_POOL_SLOTS = LOCAL_EXPERTS + PLAN_SLOTS * REPLICA_SLOTS
 TOPK = 8
 HIDDEN = 7168
 INTERMEDIATE = 2048
 TOKEN_PADDING = 8
 
-WEIGHT_SHARD_BYTES = POOL_SLOTS * HIDDEN * INTERMEDIATE * 2
-GRAD_SHARD_BYTES = POOL_SLOTS * HIDDEN * INTERMEDIATE * 4
+WEIGHT_SHARD_BYTES = WEIGHT_POOL_SLOTS * HIDDEN * INTERMEDIATE * 2
+GRAD_SHARD_BYTES = GRAD_POOL_SLOTS * HIDDEN * INTERMEDIATE * 4
 POOL_BYTES = 3 * WEIGHT_SHARD_BYTES + 3 * GRAD_SHARD_BYTES
 
 WEIGHT_SENTINEL = -320.0
@@ -59,7 +61,7 @@ class ExpertPoolAdapter:
         grads = views[3:]
         self.buffer.register_balanced_expert_pools(
             [tensor[:LOCAL_EXPERTS] for tensor in weights],
-            [tensor[LOCAL_EXPERTS:] for tensor in weights],
+            list(weights),
             [tensor[:LOCAL_EXPERTS] for tensor in grads],
             [tensor[LOCAL_EXPERTS:] for tensor in grads],
         )
@@ -112,12 +114,12 @@ def _assert_constant(tensor: torch.Tensor, expected: float, label: str) -> None:
 
 def _check_layout(views: tuple[torch.Tensor, ...]) -> None:
     gate_weight, up_weight, down_weight, gate_grad, up_grad, down_grad = views
-    assert gate_weight.shape == (POOL_SLOTS, HIDDEN, INTERMEDIATE)
-    assert up_weight.shape == (POOL_SLOTS, HIDDEN, INTERMEDIATE)
-    assert down_weight.shape == (POOL_SLOTS, INTERMEDIATE, HIDDEN)
-    assert gate_grad.shape == (POOL_SLOTS, HIDDEN, INTERMEDIATE)
-    assert up_grad.shape == (POOL_SLOTS, HIDDEN, INTERMEDIATE)
-    assert down_grad.shape == (POOL_SLOTS, INTERMEDIATE, HIDDEN)
+    assert gate_weight.shape == (WEIGHT_POOL_SLOTS, HIDDEN, INTERMEDIATE)
+    assert up_weight.shape == (WEIGHT_POOL_SLOTS, HIDDEN, INTERMEDIATE)
+    assert down_weight.shape == (WEIGHT_POOL_SLOTS, INTERMEDIATE, HIDDEN)
+    assert gate_grad.shape == (GRAD_POOL_SLOTS, HIDDEN, INTERMEDIATE)
+    assert up_grad.shape == (GRAD_POOL_SLOTS, HIDDEN, INTERMEDIATE)
+    assert down_grad.shape == (GRAD_POOL_SLOTS, INTERMEDIATE, HIDDEN)
     assert all(tensor.is_cuda and tensor.is_contiguous() for tensor in views)
     assert all(tensor.dtype == torch.bfloat16 for tensor in views[:3])
     assert all(tensor.dtype == torch.float32 for tensor in views[3:])
@@ -132,7 +134,7 @@ def _check_layout(views: tuple[torch.Tensor, ...]) -> None:
         3 * WEIGHT_SHARD_BYTES + 2 * GRAD_SHARD_BYTES,
     )
     assert tuple(tensor.data_ptr() - base for tensor in views) == expected_offsets
-    assert POOL_BYTES == 29_595_009_024
+    assert POOL_BYTES == 19_730_006_016
 
     for tensor in views:
         bytes_per_slot = tensor[0].numel() * tensor.element_size()
@@ -148,10 +150,14 @@ def _initialize_home_and_sentinels(
     weights = views[:3]
     grads = views[3:]
     for shard, tensor in enumerate(weights):
-        for local_expert in range(LOCAL_EXPERTS):
-            global_expert = rank * LOCAL_EXPERTS + local_expert
-            tensor[local_expert].fill_(_weight_value(global_expert, shard))
-        tensor[LOCAL_EXPERTS:].fill_(WEIGHT_SENTINEL)
+        tensor.fill_(WEIGHT_SENTINEL)
+        for plan_slot in range(PLAN_SLOTS):
+            begin = plan_slot * WEIGHT_SLOTS_PER_PLAN
+            for local_expert in range(LOCAL_EXPERTS):
+                global_expert = rank * LOCAL_EXPERTS + local_expert
+                tensor[begin + local_expert].fill_(
+                    _weight_value(global_expert, shard)
+                )
 
     for shard, tensor in enumerate(grads):
         for local_expert in range(LOCAL_EXPERTS):
@@ -235,7 +241,7 @@ def _check_weight_sync(
     plan_slot: int,
 ) -> None:
     for shard, tensor in enumerate(weights):
-        begin = LOCAL_EXPERTS + plan_slot * REPLICA_SLOTS
+        begin = plan_slot * WEIGHT_SLOTS_PER_PLAN + LOCAL_EXPERTS
         replica = tensor[begin : begin + REPLICA_SLOTS]
         for slot in range(REPLICA_SLOTS):
             global_expert = int(local_replica_map[slot])

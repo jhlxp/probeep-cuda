@@ -204,6 +204,10 @@ void BalancedRuntime::configure(int rank, int world_size, int device_id,
     probe_controller_summary_ = torch::zeros(
             {2, 6}, torch::TensorOptions().dtype(torch::kInt64).device(
                     torch::Device(torch::kCUDA, device_id_)));
+    transport_y_ = torch::empty(
+            {probeep::max_transport_rows(topology_), probeep::kHidden},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(
+                    torch::Device(torch::kCUDA, device_id_)));
     for (auto& state : ring_) {
         state.storage = allocate_slot(
                 device_id_, source_meta_bytes_, topology_);
@@ -346,23 +350,31 @@ void BalancedRuntime::register_expert_pools(
         EP_HOST_ASSERT(home.dim() >= 1 &&
                        home.size(0) == topology_.local_experts);
         EP_HOST_ASSERT(replica.dim() >= 1 &&
-                       replica.size(0) == kExpertPoolReplicaSlots);
+                       replica.size(0) == kExpertPoolWeightSlots);
         EP_HOST_ASSERT(home.is_contiguous() && replica.is_contiguous());
         EP_HOST_ASSERT(home.scalar_type() == replica.scalar_type());
         EP_HOST_ASSERT(home.numel() / topology_.local_experts ==
-                       replica.numel() / kExpertPoolReplicaSlots);
+                       replica.numel() / kExpertPoolWeightSlots);
         auto* home_begin = static_cast<std::uint8_t*>(home.data_ptr());
-        auto* replica_begin = static_cast<std::uint8_t*>(replica.data_ptr());
+        auto* replica_storage_begin =
+                static_cast<std::uint8_t*>(replica.data_ptr());
+        const auto replica_stride_bytes =
+                replica.stride(0) * replica.element_size();
+        auto* replica_begin = replica_storage_begin +
+                kExpertPoolHomeSlots * replica_stride_bytes;
         auto* nvl_begin = static_cast<std::uint8_t*>(local_nvl_base_);
         const auto home_address = reinterpret_cast<std::uintptr_t>(home_begin);
-        const auto replica_address = reinterpret_cast<std::uintptr_t>(replica_begin);
+        const auto replica_storage_address =
+                reinterpret_cast<std::uintptr_t>(replica_storage_begin);
+        const auto replica_address =
+                reinterpret_cast<std::uintptr_t>(replica_begin);
         const auto nvl_address = reinterpret_cast<std::uintptr_t>(nvl_begin);
         EP_HOST_ASSERT(home_address >= nvl_address &&
                        home_address + home.nbytes() <=
                                nvl_address + transport_nvl_bytes_ +
                                        kIpcPlanReserveBytes + kExpertPoolBytes);
-        EP_HOST_ASSERT(replica_address >= nvl_address &&
-                       replica_address + replica.nbytes() <=
+        EP_HOST_ASSERT(replica_storage_address >= nvl_address &&
+                       replica_storage_address + replica.nbytes() <=
                                nvl_address + transport_nvl_bytes_ +
                                        kIpcPlanReserveBytes + kExpertPoolBytes);
 
@@ -390,13 +402,16 @@ void BalancedRuntime::register_expert_pools(
         descriptor.replica_buffer_offset_bytes =
                 static_cast<std::uint64_t>(replica_address - nvl_address);
         descriptor.replica_slot_stride_bytes =
+                static_cast<std::uint64_t>(replica_stride_bytes);
+        descriptor.replica_plan_stride_bytes =
                 static_cast<std::uint64_t>(
-                        replica.stride(0) * replica.element_size());
+                        kExpertPoolWeightSlotsPerPlan * replica_stride_bytes);
         EP_HOST_ASSERT(descriptor.replica_slot_stride_bytes % 16 == 0);
+        EP_HOST_ASSERT(descriptor.replica_plan_stride_bytes % 16 == 0);
         EP_HOST_ASSERT((home.stride(0) * home.element_size()) % 16 == 0);
         descriptor.num_elements =
                 static_cast<std::uint64_t>(
-                        replica.numel() / kExpertPoolReplicaSlots);
+                        home.numel() / topology_.local_experts);
         descriptor.element_bytes =
                 static_cast<std::uint32_t>(home.element_size());
         if (registered_weight_element_bytes == 0)

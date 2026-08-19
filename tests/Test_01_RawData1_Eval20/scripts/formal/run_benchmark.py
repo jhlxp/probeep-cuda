@@ -692,12 +692,15 @@ def probe_weight_cache_mode() -> str:
 def set_probe_weight_version(
     base_version: int, *, layer_id: int, phase: str, iteration: int
 ) -> int:
-    """Materialize one layer/version identity before an invocation.
+    """Materialize one immutable layer/phase weight identity.
 
-    ``cold`` represents a complete multi-layer wavefront whose small plan ring
-    cannot retain all DSV3 layers: every invocation receives a new version and
-    therefore pays real Weight transport.  ``steady`` intentionally measures a
-    same-layer cache hit after warmup and is supplementary only.
+    A weight version identifies parameter contents, not an invocation.  Pure
+    forward iterations over one layer therefore keep the same version.  In
+    ``cold`` mode the warmup, correctness and measured phases use distinct
+    identities so the first invocation of each phase is a real cold access;
+    later iterations exercise the physical replica-bank cache.  ``steady``
+    keeps one identity across every phase so warmup populates the measured
+    cache as well.
     """
 
     mode = probe_weight_cache_mode()
@@ -709,14 +712,14 @@ def set_probe_weight_version(
             raise ValueError(f"invalid ProbeEP weight-version phase: {phase}")
         if layer_id < -1:
             raise ValueError("ProbeEP layer id must be -1 or non-negative")
-        # A persistent worker keeps the three physical replica banks across all
-        # RawData1 layers.  Layer identity must therefore be part of the model
-        # version; phase/round alone can alias a different layer's parameters.
+        # A persistent worker keeps three physical replica banks across all
+        # RawData1 layers.  Layer identity must therefore remain part of the
+        # content key, but iteration is deliberately excluded: an invocation
+        # does not mutate inference weights.
         version = (
             base_version * 1_000_000_000
             + (layer_id + 1) * 1_000_000
             + phase_offset[phase]
-            + iteration
             + 1
         )
     os.environ["PROBEEP_WEIGHT_VERSION"] = str(version)
@@ -804,35 +807,28 @@ def materialize_grouped_layout(
         )
         physical_layout = None
         if backend.variant == "probeep":
-            replica_slots = layout.num_slots - local_experts
-            plan_slots = 3
-            plan_slot = int(dispatched.handle.slot)
+            physical_home_slots = 16
+            empty_home_slots = physical_home_slots - local_experts
             home_end = layout.offsets[local_experts - 1 : local_experts]
-            final_end = layout.offsets[-1:]
-            empty_before = plan_slot * replica_slots
-            empty_after = (plan_slots - plan_slot - 1) * replica_slots
             offsets = torch.cat(
                 (
                     layout.offsets[:local_experts],
-                    home_end.expand(empty_before),
+                    home_end.expand(empty_home_slots),
                     layout.offsets[local_experts:],
-                    final_end.expand(empty_after),
                 )
             ).contiguous()
             begins = torch.cat(
                 (
                     layout.slot_begin[:local_experts],
-                    home_end.expand(empty_before),
+                    home_end.expand(empty_home_slots),
                     layout.slot_begin[local_experts:],
-                    final_end.expand(empty_after),
                 )
             ).contiguous()
             counts = torch.cat(
                 (
                     layout.slot_count[:local_experts],
-                    layout.slot_count.new_zeros(empty_before),
+                    layout.slot_count.new_zeros(empty_home_slots),
                     layout.slot_count[local_experts:],
-                    layout.slot_count.new_zeros(empty_after),
                 )
             ).contiguous()
             physical_layout = GroupedFFNLayout(
@@ -994,19 +990,20 @@ def run_grouped_expert(
     if backend.balanced:
         exec_x = exec_x[:balanced_execution_rows]
         exec_scales = exec_scales[:balanced_execution_rows]
-    dequantized = dequantize_fp8_blocks(
-        exec_x, exec_scales
-    )
+    dequantized = dequantize_fp8_blocks(exec_x, exec_scales)
     if backend.balanced:
         if backend.variant == "probeep":
             if materialized.physical_layout is None:
                 raise RuntimeError("ProbeEP physical expert layout is missing")
+            slots_per_plan = materialized.physical_layout.num_slots
+            weight_begin = int(dispatched.handle.slot) * slots_per_plan
+            weight_end = weight_begin + slots_per_plan
             run_grouped_ffn_stage_out(
                 dequantized,
                 materialized.physical_layout,
-                weights.gate,
-                weights.up,
-                weights.down,
+                weights.gate[weight_begin:weight_end],
+                weights.up[weight_begin:weight_end],
+                weights.down[weight_begin:weight_end],
                 dispatched.handle.exec_y[:balanced_execution_rows],
                 backend.extension.bf16_grouped_mm_out,
             )
@@ -2721,10 +2718,21 @@ def initialize_runtime(
             for destination, source in zip(
                 views[:3], (base.gate, base.up, base.down)
             ):
-                destination[:local_experts].copy_(
-                    source.expand(local_experts, -1, -1)
-                )
-                destination[local_experts:].zero_()
+                destination.zero_()
+                if args.variant == "probeep":
+                    # The IPC pool uses a fixed 16-home + 16-replica physical
+                    # bank for every plan-ring slot, even when EP makes the
+                    # logical home count smaller than 16.
+                    slots_per_plan = 16 + replica_slots
+                    for plan_slot in range(3):
+                        begin = plan_slot * slots_per_plan
+                        destination[begin : begin + local_experts].copy_(
+                            source.expand(local_experts, -1, -1)
+                        )
+                else:
+                    destination[:local_experts].copy_(
+                        source.expand(local_experts, -1, -1)
+                    )
             bits = min(EXPERT_FINGERPRINT_BITS, hidden)
             local_ids = torch.arange(
                 rank * local_experts,
@@ -2735,9 +2743,17 @@ def initialize_runtime(
             local_signs = expert_fingerprint_signs(local_ids, bits).to(
                 views[2].dtype
             )
-            views[2][:local_experts, :, :bits].mul_(
-                local_signs.unsqueeze(1)
-            )
+            if args.variant == "probeep":
+                slots_per_plan = 16 + replica_slots
+                for plan_slot in range(3):
+                    begin = plan_slot * slots_per_plan
+                    views[2][
+                        begin : begin + local_experts, :, :bits
+                    ].mul_(local_signs.unsqueeze(1))
+            else:
+                views[2][:local_experts, :, :bits].mul_(
+                    local_signs.unsqueeze(1)
+                )
             for grad in views[3:]:
                 grad.zero_()
             backend.register_expert_pools(tuple(views), local_experts)
@@ -2809,7 +2825,7 @@ def main(
     local_experts = int(
         os.getenv("LOCAL_EXPERTS", str(num_experts // world_size))
     )
-    default_replica_slots = 32 if args.variant == "probeep" else 16
+    default_replica_slots = 16
     replica_slots = int(os.getenv("REPLICA_SLOTS", str(default_replica_slots)))
     token_padding = int(os.getenv("TOKEN_PADDING", "8"))
     system, balance = variant_identity(args.variant)

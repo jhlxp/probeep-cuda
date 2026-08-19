@@ -1134,9 +1134,14 @@ class RuntimeBackend:
         weights = views[:3]
         grads = views[3:]
         replica_begin = 16 if self.variant == "probeep" else local_experts
+        replica_weights = (
+            list(weights)
+            if self.variant == "probeep"
+            else [tensor[replica_begin:] for tensor in weights]
+        )
         self.buffer.register_balanced_expert_pools(
             [tensor[:local_experts] for tensor in weights],
-            [tensor[replica_begin:] for tensor in weights],
+            replica_weights,
             [tensor[:local_experts] for tensor in grads],
             [tensor[replica_begin:] for tensor in grads],
         )
