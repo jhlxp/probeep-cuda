@@ -68,6 +68,7 @@ class TorchEventHandle:
 
 @dataclass(frozen=True)
 class NCCLLayout:
+    routing_ref: torch.Tensor
     order: torch.Tensor
     source_token: torch.Tensor
     local_expert: torch.Tensor
@@ -176,6 +177,7 @@ class NCCLBackend:
         # completed during untimed warmup and cached for the immutable layer.
         event.synchronize()
         layout = NCCLLayout(
+            routing_ref=topk_idx,
             order=order,
             source_token=source_token.index_select(0, order),
             local_expert=(flat_expert.index_select(0, order) % self.local_experts),
